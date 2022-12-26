@@ -16,6 +16,8 @@
 
 package main
 
+import "C"
+
 import (
 	"crypto/rand"
 	"encoding/binary"
@@ -28,6 +30,8 @@ import (
 	"strings"
 	"sync"
 )
+
+func main() {}
 
 // fp represents a field element stored on 4 words (uint64)
 //

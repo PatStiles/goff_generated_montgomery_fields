@@ -16,11 +16,14 @@
 
 package main
 
+import "C"
+
 import (
 	"math/bits"
 )
 
 // madd0 hi = a*b + c (discards lo bits)
+//export madd0
 func madd0(a, b, c uint64) (hi uint64) {
 	var carry, lo uint64
 	hi, lo = bits.Mul64(a, b)
@@ -30,6 +33,7 @@ func madd0(a, b, c uint64) (hi uint64) {
 }
 
 // madd1 hi, lo = a*b + c
+//export madd1
 func madd1(a, b, c uint64) (hi uint64, lo uint64) {
 	var carry uint64
 	hi, lo = bits.Mul64(a, b)

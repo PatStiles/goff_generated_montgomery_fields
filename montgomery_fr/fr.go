@@ -31,8 +31,6 @@ import (
 	"sync"
 )
 
-func main() {}
-
 // fr represents a field element stored on 4 words (uint64)
 //
 // fr are assumed to be in Montgomery form in all methods.
@@ -69,6 +67,8 @@ var qfr = fr{
 }
 
 var _modulus big.Int // q stored as big.Int
+
+func main() {}
 
 // Modulus returns q as a big.Int
 //
