@@ -16,8 +16,13 @@
 
 package main
 
+/*
+#cgo CFLAGS: -fPIC
+#cgo LDFLAGS: -fPIC
+#include <stdint.h>
+typedef uint64_t fp[4];
+*/
 import "C"
-
 import (
 	"crypto/rand"
 	"encoding/binary"
@@ -30,9 +35,7 @@ import (
 	"strings"
 	"sync"
 )
-
 func main() {}
-
 // fp represents a field element stored on 4 words (uint64)
 //
 // fp are assumed to be in Montgomery form in all methods.
@@ -135,6 +138,22 @@ func (z *fp) Set(x *fp) *fp {
 	return z
 }
 
+// Set z = x and returns z
+func (z *fp) cSet(x *C.fp) *fp {
+	z[0] = uint64(x[0])
+	z[1] = uint64(x[1])
+	z[2] = uint64(x[2])
+	z[3] = uint64(x[3])
+	return z
+}
+
+func (z *C.fp) cUnSet(x *fp) *C.fp {
+	z[0] = C.ulong(x[0])
+	z[1] = C.ulong(x[1])
+	z[2] = C.ulong(x[2])
+	z[3] = C.ulong(x[3])
+	return z
+}
 // SetInterface converts provided interface into fp
 // returns an error if provided type is not supported
 // supported types:
@@ -406,6 +425,18 @@ func (z *fp) Halve() {
 
 }
 
+//export cMul
+func (z *C.fp) cMul(x, y *C.fp) *C.fp {
+
+  var e, f, g *fp
+  e.cSet(z)
+  f.cSet(x)
+  g.cSet(y)
+  mul(e, f, g)
+	return z.cUnSet(e)
+
+}
+
 // Mul z = x * y (mod q)
 //
 // x and y must be strictly inferior to q
@@ -464,11 +495,44 @@ func (z *fp) Square(x *fp) *fp {
 	return z
 }
 
+//export cFromMont
+func (z *C.fp) cFromMont() *C.fp {
+  var e *fp
+  e.cSet(z)
+	fromMont(e)
+	return z.cUnSet(e)
+}
+
 // FromMont converts z in place (i.e. mutates) from Montgomery to regular representation
 // sets and returns z = z * 1
 func (z *fp) FromMont() *fp {
 	fromMont(z)
 	return z
+}
+
+// Add z = x + y (mod q)
+//export cAdd
+func (z *C.fp) cAdd(x, y *C.fp) *C.fp {
+  var e, f, g fp
+  e.cSet(z)
+  f.cSet(x)
+  g.cSet(y)
+
+	var carry uint64
+	e[0], carry = bits.Add64(f[0], g[0], 0)
+	e[1], carry = bits.Add64(f[1], g[1], carry)
+	e[2], carry = bits.Add64(f[2], g[2], carry)
+  e[3], _ = bits.Add64(f[3], g[3], carry)
+
+	// if z >= q → z -= q
+	if !e.smallerThanModulus() {
+		var b uint64
+		e[0], b = bits.Sub64(e[0], q0, 0)
+		e[1], b = bits.Sub64(e[1], q1, b)
+		e[2], b = bits.Sub64(e[2], q2, b)
+		e[3], _ = bits.Sub64(e[3], q3, b)
+	}
+	return z.cUnSet(&e)
 }
 
 // Add z = x + y (mod q)
@@ -509,6 +573,29 @@ func (z *fp) Double(x *fp) *fp {
 		z[3], _ = bits.Sub64(z[3], q3, b)
 	}
 	return z
+}
+
+// Sub z = x - y (mod q)
+//export cSub
+func (z *C.fp) cSub(x, y *C.fp) *C.fp {
+  var e, f, g fp
+  e.cSet(z)
+  f.cSet(x)
+  g.cSet(y)
+
+	var b uint64
+	e[0], b = bits.Sub64(f[0], g[0], 0)
+	e[1], b = bits.Sub64(f[1], g[1], b)
+	e[2], b = bits.Sub64(f[2], g[2], b)
+	e[3], b = bits.Sub64(f[3], g[3], b)
+	if b != 0 {
+		var c uint64
+		e[0], c = bits.Add64(e[0], q0, 0)
+		e[1], c = bits.Add64(e[1], q1, c)
+		e[2], c = bits.Add64(e[2], q2, c)
+		e[3], _ = bits.Add64(e[3], q3, c)
+	}
+	return z.cUnSet(&e)
 }
 
 // Sub z = x - y (mod q)
@@ -778,6 +865,15 @@ var rSquare = fp{
 	3129137299524312099,
 	419701826671360399,
 	524908885293268753,
+}
+
+//export cToMont
+func (z *C.fp) cToMont() *C.fp {
+  var e *fp
+  e.cSet(z)
+
+	e.Mul(e, &rSquare)
+  return z.cUnSet(e)
 }
 
 // ToMont converts z to Montgomery form
@@ -1124,6 +1220,163 @@ const (
 	inversionCorrectionFactorWord3 = 1857276366933877101
 	invIterationsN                 = 18
 )
+
+//export cInverse
+func (z *C.fp) cInverse(x *C.fp) *C.fp {
+	// Implements "Optimized Binary GCD for Modular Inversion"
+	// https://github.com/pornin/bingcd/blob/main/doc/bingcd.pdf
+  var e, f *fp
+  e.cSet(z)
+  f.cSet(x)
+	a := *f
+	b := fp{
+		q0,
+		q1,
+		q2,
+		q3,
+	} // b := q
+
+	u := fp{1}
+
+	// Update factors: we get [u; v] ← [f₀ g₀; f₁ g₁] [u; v]
+	// cᵢ = fᵢ + 2³¹ - 1 + 2³² * (gᵢ + 2³¹ - 1)
+	var c0, c1 int64
+
+	// Saved update factors to reduce the number of field multiplications
+	var pf0, pf1, pg0, pg1 int64
+
+	var i uint
+
+	var v, s fp
+
+	// Since u,v are updated every other iteration, we must make sure we terminate after evenly many iterations
+	// This also lets us get away with half as many updates to u,v
+	// To make this constant-time-ish, replace the condition with i < invIterationsN
+	for i = 0; i&1 == 1 || !a.IsZero(); i++ {
+		n := max(a.BitLen(), b.BitLen())
+		aApprox, bApprox := approximate(&a, n), approximate(&b, n)
+
+		// f₀, g₀, f₁, g₁ = 1, 0, 0, 1
+		c0, c1 = updateFactorIdentityMatrixRow0, updateFactorIdentityMatrixRow1
+
+		for j := 0; j < approxLowBitsN; j++ {
+
+			// -2ʲ < f₀, f₁ ≤ 2ʲ
+			// |f₀| + |f₁| < 2ʲ⁺¹
+
+			if aApprox&1 == 0 {
+				aApprox /= 2
+			} else {
+				s, borrow := bits.Sub64(aApprox, bApprox, 0)
+				if borrow == 1 {
+					s = bApprox - aApprox
+					bApprox = aApprox
+					c0, c1 = c1, c0
+					// invariants unchanged
+				}
+
+				aApprox = s / 2
+				c0 = c0 - c1
+
+				// Now |f₀| < 2ʲ⁺¹ ≤ 2ʲ⁺¹ (only the weaker inequality is needed, strictly speaking)
+				// Started with f₀ > -2ʲ and f₁ ≤ 2ʲ, so f₀ - f₁ > -2ʲ⁺¹
+				// Invariants unchanged for f₁
+			}
+
+			c1 *= 2
+			// -2ʲ⁺¹ < f₁ ≤ 2ʲ⁺¹
+			// So now |f₀| + |f₁| < 2ʲ⁺²
+		}
+
+		s = a
+
+		var g0 int64
+		// from this point on c0 aliases for f0
+		c0, g0 = updateFactorsDecompose(c0)
+		aHi := a.linearCombNonModular(&s, c0, &b, g0)
+		if aHi&signBitSelector != 0 {
+			// if aHi < 0
+			c0, g0 = -c0, -g0
+			aHi = negL(&a, aHi)
+		}
+		// right-shift a by k-1 bits
+		a[0] = (a[0] >> approxLowBitsN) | ((a[1]) << approxHighBitsN)
+		a[1] = (a[1] >> approxLowBitsN) | ((a[2]) << approxHighBitsN)
+		a[2] = (a[2] >> approxLowBitsN) | ((a[3]) << approxHighBitsN)
+		a[3] = (a[3] >> approxLowBitsN) | (aHi << approxHighBitsN)
+
+		var f1 int64
+		// from this point on c1 aliases for g0
+		f1, c1 = updateFactorsDecompose(c1)
+		bHi := b.linearCombNonModular(&s, f1, &b, c1)
+		if bHi&signBitSelector != 0 {
+			// if bHi < 0
+			f1, c1 = -f1, -c1
+			bHi = negL(&b, bHi)
+		}
+		// right-shift b by k-1 bits
+		b[0] = (b[0] >> approxLowBitsN) | ((b[1]) << approxHighBitsN)
+		b[1] = (b[1] >> approxLowBitsN) | ((b[2]) << approxHighBitsN)
+		b[2] = (b[2] >> approxLowBitsN) | ((b[3]) << approxHighBitsN)
+		b[3] = (b[3] >> approxLowBitsN) | (bHi << approxHighBitsN)
+
+		if i&1 == 1 {
+			// Combine current update factors with previously stored ones
+			// [F₀, G₀; F₁, G₁] ← [f₀, g₀; f₁, g₁] [pf₀, pg₀; pf₁, pg₁], with capital letters denoting new combined values
+			// We get |F₀| = | f₀pf₀ + g₀pf₁ | ≤ |f₀pf₀| + |g₀pf₁| = |f₀| |pf₀| + |g₀| |pf₁| ≤ 2ᵏ⁻¹|pf₀| + 2ᵏ⁻¹|pf₁|
+			// = 2ᵏ⁻¹ (|pf₀| + |pf₁|) < 2ᵏ⁻¹ 2ᵏ = 2²ᵏ⁻¹
+			// So |F₀| < 2²ᵏ⁻¹ meaning it fits in a 2k-bit signed register
+
+			// c₀ aliases f₀, c₁ aliases g₁
+			c0, g0, f1, c1 = c0*pf0+g0*pf1,
+				c0*pg0+g0*pg1,
+				f1*pf0+c1*pf1,
+				f1*pg0+c1*pg1
+
+			s = u
+
+			// 0 ≤ u, v < 2²⁵⁵
+			// |F₀|, |G₀| < 2⁶³
+			u.linearComb(&u, c0, &v, g0)
+			// |F₁|, |G₁| < 2⁶³
+			v.linearComb(&s, f1, &v, c1)
+
+		} else {
+			// Save update factors
+			pf0, pg0, pf1, pg1 = c0, g0, f1, c1
+		}
+	}
+
+	// For every iteration that we miss, v is not being multiplied by 2ᵏ⁻²
+	const pSq uint64 = 1 << (2 * (k - 1))
+	a = fp{pSq}
+	// If the function is constant-time ish, this loop will not run (no need to take it out explicitly)
+	for ; i < invIterationsN; i += 2 {
+		// could optimiee further with mul by word routine or by pre-computing a table since with k=26,
+		// we would multiply by pSq up to 13times;
+		// on x86, the assembly routine outperforms generic code for mul by word
+		// on arm64, we may loose up to ~5% for 6 limbs
+		mul(&v, &v, &a)
+	}
+
+	u.Set(f) // for correctness check
+
+	e.Mul(&v, &fp{
+		inversionCorrectionFactorWord0,
+		inversionCorrectionFactorWord1,
+		inversionCorrectionFactorWord2,
+		inversionCorrectionFactorWord3,
+	})
+
+	// correctness check
+	v.Mul(&u, e)
+	if !v.IsOne() && !u.IsZero() {
+		e.inverseExp(&u)
+    return z.cUnSet(e)
+	}
+
+	return z.cUnSet(e)
+}
 
 // Inverse z = x⁻¹ (mod q)
 //
