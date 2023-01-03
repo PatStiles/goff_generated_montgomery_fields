@@ -1,4 +1,4 @@
-module fr.go
+module main
 
 go 1.19
 
@@ -6,7 +6,6 @@ require (
 	github.com/consensys/gnark-crypto v0.8.0
 	github.com/leanovate/gopter v0.2.9
 	github.com/stretchr/testify v1.8.1
-	golang.org/x/sys v0.3.0
 )
 
 require (
